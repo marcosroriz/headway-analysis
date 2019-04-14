@@ -1,0 +1,21 @@
+CREATE USER ufg WITH
+  LOGIN
+  SUPERUSER
+  CREATEDB
+  CREATEROLE
+  INHERIT
+  NOREPLICATION
+  CONNECTION LIMIT -1
+  PASSWORD 'ufgufg';
+
+CREATE DATABASE headway
+  WITH
+  OWNER = ufg
+  ENCODING = 'UTF8'
+  CONNECTION LIMIT = -1;
+
+CREATE EXTENSION postgis;
+
+SELECT ST_AsText(ST_ClosestPoint(linha.wkb_geometry, pt.geometry))
+FROM ST_GeomFromText('POINT(-49.250877 -16.659182)', 4326) AS pt,
+     linha263 AS linha
