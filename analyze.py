@@ -6,6 +6,7 @@ import csv
 import click
 import numpy as np
 import psycopg2
+import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from postgis import register
 
@@ -123,7 +124,7 @@ def outlier(lat, lng, line, dbCursor):
     dbCursor.execute(pointDistanceSQL)
     pointDistance = dbCursor.fetchone()
 
-    if pointDistance[0] >= 100:
+    if pointDistance[0] >= 250:
         return True
     else:
         return False
@@ -152,7 +153,7 @@ def withinBusStop(travDistance, busStops):
     return within
 
 
-def processAVL(avlFileName, line, spacing, busStops, dbCursor):
+def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
     # List of raw headway at each stop
     rawHeadway = collections.defaultdict(list)
 
@@ -165,6 +166,11 @@ def processAVL(avlFileName, line, spacing, busStops, dbCursor):
     # Historical positions of a given bus stop
     historical = collections.defaultdict(list)
     lastPos = dict()
+
+    # Headway Trips (by busID)
+    trips = collections.defaultdict(dict)
+    x = list()
+    y = list()
 
     # Read AVL file
     avlFile = open(avlFileName)
@@ -187,9 +193,7 @@ def processAVL(avlFileName, line, spacing, busStops, dbCursor):
                "lat": lat,
                "lng": lng}
 
-        if busLine == line and 12 <= date.hour < 14 and letreiro != "FORA DE SERVICO":
-            print("PROCESSING AVL DATA AT: ", date.strftime("%c"))
-
+        if busLine == line and start <= date.hour < end and letreiro != "FORA DE SERVICO":
             # Get Travelled Distance
             distance = getTravDistance(lat, lng, line, dbCursor)
 
@@ -200,6 +204,9 @@ def processAVL(avlFileName, line, spacing, busStops, dbCursor):
             if outlier(lat, lng, line, dbCursor):
                 lastRegBusPosition[busID] = avl
                 lastRegBusStop[busID] = lastBusStop
+                trips[busID]["x"] = list()
+                trips[busID]["y"] = list()
+
                 continue
 
             # Retrieve the last registered bus stop that this AVL has travelled (that we registered)
@@ -209,6 +216,11 @@ def processAVL(avlFileName, line, spacing, busStops, dbCursor):
                 # So, we register this bus stop
                 lastRegBusPosition[busID] = avl
                 lastRegBusStop[busID] = lastBusStop
+
+                trips[busID]["x"] = list()
+                trips[busID]["y"] = list()
+                print("Inicializando a lista do busID", busID)
+
                 continue
             else:
                 # Yes, we do have a previous record of this bus!
@@ -223,6 +235,16 @@ def processAVL(avlFileName, line, spacing, busStops, dbCursor):
                 if lastBusStop["id"] != 1 and (lastRegBusStop[busID]["id"] > lastBusStop["id"] or prevDistance > distance):
                     lastRegBusPosition[busID] = avl
                     lastRegBusStop[busID] = lastBusStop
+
+                    try:
+                        if len(trips[busID]["x"]):
+                            plt.plot(trips[busID]["x"], trips[busID]["y"])
+
+                            trips[busID]["x"].clear()
+                            trips[busID]["y"].clear()
+                    except:
+                        print("Deu pau..., vamos ver o que está acontecendo")
+
                     continue
 
                 # Get the number of travelled stops (diff between current and previous registered)
@@ -243,13 +265,23 @@ def processAVL(avlFileName, line, spacing, busStops, dbCursor):
                         timePassedAtBusStop = prevDate + timedelta(seconds=(distancePassedBusStop / velocity))
 
                         rawHeadway[passedStop["id"]].append((busID, timePassedAtBusStop))
-                        historical[busID].append(passedStop["id"])
+
+                        historical[busID].append((timePassedAtBusStop, passedStop["id"]))
+                        x.append(timePassedAtBusStop)
+                        y.append(passedStop["id"])
+                        trips[busID]["x"].append(timePassedAtBusStop)
+                        trips[busID]["y"].append(passedStop["id"])
+
 
                 lastRegBusPosition[busID] = avl
                 lastRegBusStop[busID] = lastBusStop
 
-        if date.hour >= 14:
+        if date.hour >= end:
             break
+
+    plt.show()
+    plt.scatter(x, y)
+    plt.show()
 
     return rawHeadway
 
@@ -273,17 +305,29 @@ def deriveHeadway(rawHeadway):
     return headway
 
 
+def writeOutput(processedHeadway, output):
+    for busStopID in sorted(processedHeadway.keys()):
+        outputfilename = "out/ponto." + str(busStopID) + "." + output
+        with open(outputfilename, 'a+', newline='') as outfile:
+            writer = csv.writer(outfile, delimiter=',')
+            # writer.writerow(["headway"])
+            for h in processedHeadway[busStopID]:
+                writer.writerow([h])
+
+
 @click.command()
-@click.option("--avl",     default="dia.2019-02-18.csv",  help="AVL data")
-@click.option("--line",    default=263,                   help="Bus Line")
-@click.option("--stops",   default="data/263-pontos.csv", help="File containing Bus Stops")
-@click.option("--spacing", default=0.0025,                help="Interpolation Spacing")
-@click.option("--headway", default=930,                   help="Expected Scheduled Headway (in seconds)")
-@click.option("--db",      default="highway",             help="PostGreSQL Database")
-@click.option("--dbuser",  default="ufg",                 help="PostGreSQL User")
-@click.option("--dbpass",  default="ufgufg",              help="PostGreSQL Password")
-@click.option("--output",  default="saida.csv",           help="Output file")
-def main(avl, line, stops, spacing, headway, db, dbuser, dbpass, output):
+@click.option("--avl",     default="avl/diasuteis/dia.2019-03-15.csv", help="AVL data")
+@click.option("--line",    default=263,                                help="Bus Line")
+@click.option("--stops",   default="data/263-pontos.csv",              help="File containing Bus Stops")
+@click.option("--spacing", default=0.0025,                             help="Interpolation Spacing")
+@click.option("--start",   default=8,                                  help="Start time")
+@click.option("--end",     default=10,                                 help="End time")
+@click.option("--headway", default=420,                                help="Expected Scheduled Headway (in seconds)")
+@click.option("--db",      default="highway",                          help="PostGreSQL Database")
+@click.option("--dbuser",  default="ufg",                              help="PostGreSQL User")
+@click.option("--dbpass",  default="ufgufg",                           help="PostGreSQL Password")
+@click.option("--output",  default="output.csv",                       help="Output file")
+def main(avl, line, stops, spacing, start, end, headway, db, dbuser, dbpass, output):
     # Create DB connection and get a cursor
     dbConnection, dbCursor = connectDB(db, dbuser, dbpass, line, spacing)
 
@@ -293,13 +337,14 @@ def main(avl, line, stops, spacing, headway, db, dbuser, dbpass, output):
     # Retrieve Raw Headways
     # Raw here means that we are just storing the datetime where a bus passes through the stop
     # We will calculate the headway (the difference between such occurrences) later
-    rawHeadway = processAVL(avl, line, spacing, busStops, dbCursor)
+    rawHeadway = processAVL(avl, line, spacing, start, end, busStops, dbCursor)
 
     # Now, lets derive the Headway data for every bus stop from raw headway
     processedHeadway = deriveHeadway(rawHeadway)
 
     # Output processed headway
-    
+    writeOutput(processedHeadway, output)
+
     # Output some statistics
     print("MEAN", "MIN", "MAX", "STDEV")
     for busStopID in sorted(processedHeadway.keys()):
@@ -310,6 +355,7 @@ def main(avl, line, stops, spacing, headway, db, dbuser, dbpass, output):
         max = np.max(headwayAtStop)
         print(busStopID, cvh, media, media/60, min, min/60, max, max/60)
 
+    print("FINISHED PROCESSING")
 
 if __name__ == "__main__":
     main()
