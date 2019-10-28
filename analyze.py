@@ -7,8 +7,35 @@ import click
 import numpy as np
 import psycopg2
 import matplotlib.pyplot as plt
+import matplotlib.style as style
+
+from matplotlib import cm
+from matplotlib.dates import MINUTELY, DateFormatter, rrulewrapper, RRuleLocator, drange, MinuteLocator
+from matplotlib.ticker import MaxNLocator, MultipleLocator, FormatStrFormatter, AutoMinorLocator
 from datetime import datetime, timedelta
 from postgis import register
+from haversine import haversine, Unit
+
+
+colors = ["#E58606","#5D69B1","#52BCA3","#99C945","#CC61B0","#24796C","#DAA51B","#2F8AC4","#764E9F","#ED645A","#CC3A8E","#A5AA99",
+          "#88CCEE","#CC6677","#DDCC77","#117733","#332288","#AA4499","#44AA99","#999933","#882255","#661100","#6699CC","#888888"]
+colordict = {"i": 0}
+
+
+def getColor(busID, d):
+    # if d.hour <= 8:
+    #     return "#e07f05"
+    # else:
+    #     return "#50b28d"
+
+    i = colordict["i"]
+    if busID not in colordict:
+        colordict[busID] = i
+        colordict["i"] = (i + 1) % len(colors)
+    else:
+        i = colordict[busID]
+
+    return colors[i]
 
 
 def connectDB(db, dbuser, dbpass, line, spacing):
@@ -36,6 +63,7 @@ def connectDB(db, dbuser, dbpass, line, spacing):
                          """.format(spacing)
     dbCursor.execute(dbMultiFunctionSQL)
 
+    dbConnection.commit()
     return (dbConnection, dbCursor)
 
 
@@ -51,7 +79,7 @@ def buildStopsFromFile(stopsFileName):
     :param stopsFileName:
     :return: a dictionary containing bus stops information
     """
-    stopsFile = open(stopsFileName)
+    stopsFile = open(stopsFileName, encoding='utf-8')
     stopsReader = csv.DictReader(stopsFile)
 
     stops = dict()
@@ -60,10 +88,12 @@ def buildStopsFromFile(stopsFileName):
         index = int(aStop["id"])
 
         stops[index] = {}
+        stops[index]["term"] = bool(int(aStop["term"]))
         stops[index]["id"] = index
         stops[index]["lat"] = float(aStop["lat"])
         stops[index]["lng"] = float(aStop["lng"])
-        stops[index]["dist"] = int(aStop["dist"])
+        stops[index]["dist"] = int(aStop["travdist"])
+        # stops[index]["nome"] = str(aStop["nome"])
 
     return stops
 
@@ -130,27 +160,41 @@ def outlier(lat, lng, line, dbCursor):
         return False
 
 
-def getLastBusStop(travDistance, busStops):
-    lastStop = None
-
-    for id, stop in busStops.items():
-        if stop["dist"] <= travDistance:
-            lastStop = stop
-        elif stop["dist"] - 15 <= travDistance <= stop["dist"] + 15:
-            # We consider a 15m error tolerance for travDistance (when it is close to a busStop)
-            lastStop = stop
-
-    return lastStop
-
-
-def withinBusStop(travDistance, busStops):
+def getLastBusStop(lat, lng, travDistance, busStops):
+    lastStop = busStops[1]
     within = False
 
     for id, stop in busStops.items():
-        if stop["dist"] - 15 <= travDistance <= stop["dist"] + 15:
+        if stop["term"] and haversine((lat, lng), (stop["lat"], stop["lng"]), unit=Unit.METERS) <= 100:
+            lastStop = stop
             within = True
+            break
+        elif not stop["term"] and haversine((lat, lng), (stop["lat"], stop["lng"]), unit=Unit.METERS) <= 15:
+            lastStop = stop
+            break
+        elif stop["dist"] <= travDistance:
+            lastStop = stop
 
-    return within
+    return lastStop, within
+
+
+def getVelocityAndDistance(tx, ty, tp, line, dbCursor):
+    lat, lng = tp[-1]
+    prevLat, prevLng = tp[-2]
+
+    distance = getTravDistance(lat, lng, line, dbCursor)
+    prevDistance = getTravDistance(prevLat, prevLng, line, dbCursor)
+
+    date = tx[-1]
+    prevDate = tx[-2]
+
+    # We travelled through at least one bus stops
+    # Compute the velocity to get to the current position
+    deltaDistance = distance - prevDistance
+    deltaDate = (date - prevDate).total_seconds()
+    velocity = deltaDistance / deltaDate
+
+    return velocity, distance
 
 
 def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
@@ -163,18 +207,38 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
     # Last registered bus stop
     lastRegBusStop = collections.defaultdict(dict)
 
-    # Historical positions of a given bus stop
-    historical = collections.defaultdict(list)
-    lastPos = dict()
+    # Historical position of vehicles
+    historicalAVL = dict()
 
     # Headway Trips (by busID)
     trips = collections.defaultdict(dict)
-    x = list()
-    y = list()
 
     # Read AVL file
     avlFile = open(avlFileName)
     avlReader = csv.DictReader(avlFile)
+
+    # Periodiciade e Numero de Dados
+    periodicidade = []
+    numdadosbrutos = 0
+    numdadosfiltro = 0
+
+    # Graphics Config
+    style.use("seaborn-paper")
+    fig, ax = plt.subplots()
+    ax.xaxis.set_major_formatter(DateFormatter('%H:%M'))
+    ax.xaxis.set_major_locator(MinuteLocator(byminute=[0,10,20,30,40,50]))
+    ax.xaxis.set_minor_locator(MinuteLocator(interval=1))
+
+    ax.xaxis.set_tick_params(rotation=90)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.yaxis.set_minor_locator(MultipleLocator(1))
+    ytick = [1, 5, 10, 15, 20, 25, 30, 35, 37]
+    ylabel = ["T. Praça A", 5, 10, 15, "T. Praça da Bíblia", 25, 30, 35, "T. Praça A"]
+    # for v in busStops.values():
+    #     ytick.append(v["id"])
+    #     ylabel.append(v["nome"])
+    #
+    plt.yticks(ytick, ylabel)
 
     # Process AVL data
     for avlData in avlReader:
@@ -182,32 +246,49 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
         date = datetime.strptime(avlData["data"], "%Y-%m-%d %H:%M:%S")
         busLine = int(avlData["idlinha"])
         busID = int(avlData["idonibus"])
-        busDirection = int(avlData["direcao"])
         lat = float(avlData["lat"])
         lng = float(avlData["lng"])
         letreiro = avlData["letreiro"]
 
-        avl = {"date": date,
-               "line": busLine,
-               "busID": busID,
-               "lat": lat,
-               "lng": lng}
+        avl = {
+            "date": date,
+            "line": busLine,
+            "busID": busID,
+            "lat": lat,
+            "lng": lng
+        }
 
         if busLine == line and start <= date.hour < end and letreiro != "FORA DE SERVICO":
-            # Get Travelled Distance
-            distance = getTravDistance(lat, lng, line, dbCursor)
+            print(avl)
+            numdadosbrutos = numdadosbrutos + 1
 
-            # Retrieve the last bus stop that this AVL has travelled
-            lastBusStop = getLastBusStop(distance, busStops)
+            # Check if data is duplicate
+            if lastRegBusPosition[busID]:
+                if lastRegBusPosition[busID]["lat"] == lat and lastRegBusPosition[busID]["lng"] == lng:
+                    print("POSIÇÃO IDÊNTICA")
+                    continue
 
             # Check if AVL data is an outlier (going to garage, maintenance)
             if outlier(lat, lng, line, dbCursor):
                 lastRegBusPosition[busID] = avl
-                lastRegBusStop[busID] = lastBusStop
-                trips[busID]["x"] = list()
-                trips[busID]["y"] = list()
-
+                if busID in lastRegBusStop:
+                    del lastRegBusStop[busID]
                 continue
+
+            numdadosfiltro = numdadosfiltro + 1
+
+            # Ok, AVL is not an outlier
+            # Get Travelled Distance
+            distance = getTravDistance(lat, lng, line, dbCursor)
+
+            # Retrieve the last bus stop that this AVL has travelled
+            lastBusStop, within = getLastBusStop(lat, lng, distance, busStops)
+
+            if busID == 20142:
+                print("bugzao")
+
+            if busID == 20142 and date.hour == 11 and date.minute == 15 and date.second == 42:
+                print("tou aqui")
 
             # Retrieve the last registered bus stop that this AVL has travelled (that we registered)
             # Check if we have registered anything previously
@@ -217,42 +298,101 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
                 lastRegBusPosition[busID] = avl
                 lastRegBusStop[busID] = lastBusStop
 
-                trips[busID]["x"] = list()
-                trips[busID]["y"] = list()
-                print("Inicializando a lista do busID", busID)
-
+                trips[busID]["x"] = [date]
+                trips[busID]["d"] = [date]
+                trips[busID]["y"] = [lastBusStop["id"]]
+                trips[busID]["p"] = [(lat, lng)]
+                print("INICIALIZANDO a lista do busID", busID)
                 continue
             else:
                 # Yes, we do have a previous record of this bus!
-                # Let's get the data from the previous registered bus position
-                prevDate = lastRegBusPosition[busID]["date"]
-                prevLat = lastRegBusPosition[busID]["lat"]
-                prevLng = lastRegBusPosition[busID]["lng"]
+                # Let's get the data from the last registered bus position
+                prevAVL = lastRegBusPosition[busID]
+                prevDate = prevAVL["date"]
+                prevLat = prevAVL["lat"]
+                prevLng = prevAVL["lng"]
                 prevDistance = getTravDistance(prevLat, prevLng, line, dbCursor)
                 prevStopIndex = lastRegBusStop[busID]["id"]
+                _, prevWithin = getLastBusStop(prevLat, prevLng, distance, busStops)
 
-                # Check if AVL is travelling in opposite direction (prev distance is bigger than current distance)
-                if lastBusStop["id"] != 1 and (lastRegBusStop[busID]["id"] > lastBusStop["id"] or prevDistance > distance):
+                # Salva a periodiciade de envio
+                periodicidade.append((date - prevDate).total_seconds())
+
+                # Data muito passada
+                if (
+                        (lastRegBusStop[busID]["term"]
+                            and (date - trips[busID]["x"][-1]).total_seconds() > 120
+                            and haversine((lat, lng), trips[busID]["p"][-1], unit=Unit.METERS) <= 100)
+                    or
+                        (lastRegBusStop[busID]["term"]
+                            and (date - prevDate).total_seconds() > 300)
+                    or
+                        (distance <= prevDistance and lastRegBusStop[busID]["id"] != lastBusStop["id"]
+                           and len(trips[busID]["x"]) < 5)
+                ):
+                    lastRegBusPosition[busID] = avl
+                    lastRegBusStop[busID] = lastBusStop
+                    trips[busID]["x"][-1] = date
+                    trips[busID]["d"][-1] = date
+                    trips[busID]["y"][-1] = lastBusStop["id"]
+                    trips[busID]["p"][-1] = (lat, lng)
+                    print("REINICIALIZANDO a lista do busID", busID)
+                    continue
+
+                # Check if AVL has finished the trip (went back to first stop)
+                if (len(trips[busID]["x"]) <= 2 and
+                    lastRegBusStop[busID]["id"] > lastBusStop["id"] and lastBusStop["id"] == 1):
+                    lastRegBusPosition[busID] = prevAVL
+                    lastRegBusStop[busID] = lastBusStop
+
+                    trips[busID]["x"] = [prevDate]
+                    trips[busID]["d"] = [prevDate]
+                    trips[busID]["y"] = [lastBusStop["id"]]
+                    trips[busID]["p"] = [(prevLat, prevLng)]
+                    print("BUGGGG da lista do busID", busID)
+                    continue
+                elif lastRegBusStop[busID]["id"] > lastBusStop["id"] and lastBusStop["id"] <= 2:
+                    if len(trips[busID]["x"]) > 36:
+                        print("parou aqui q da merda")
+
                     lastRegBusPosition[busID] = avl
                     lastRegBusStop[busID] = lastBusStop
 
-                    try:
-                        if len(trips[busID]["x"]):
-                            plt.plot(trips[busID]["x"], trips[busID]["y"])
+                    if len(trips[busID]["x"]):
+                        trips[busID]["x"].append(date)
+                        trips[busID]["d"].append(date)
+                        trips[busID]["y"].append(37)
+                        trips[busID]["p"].append((lat, lng))
+                        plt.plot_date(trips[busID]["x"], trips[busID]["y"], "-", color = getColor(busID, trips[busID]["x"][0]), marker="o", markersize=5)
 
-                            trips[busID]["x"].clear()
-                            trips[busID]["y"].clear()
-                    except:
-                        print("Deu pau..., vamos ver o que está acontecendo")
+                        # rawHeadway[passedStop["id"]].append((busID, timePassedAtBusStop))
+                        for i in range(len(trips[busID]["x"])):
+                            rawHeadway[trips[busID]["y"][i]].append((busID, trips[busID]["x"][i]))
 
+                        trips[busID]["x"] = []
+                        trips[busID]["d"] = []
+                        trips[busID]["y"] = []
+                        trips[busID]["p"] = []
+                        del lastRegBusStop[busID]
+
+                    continue
+                elif lastRegBusStop[busID]["id"] > lastBusStop["id"]:
+                    lastRegBusPosition[busID] = avl
+                    continue
+                elif (lastBusStop["id"] == 35 or lastBusStop["id"] == 36) and lastRegBusStop[busID]["id"] == 1:
+                    print("CURVINHA INICIAL")
+                    lastRegBusPosition[busID] = avl
                     continue
 
                 # Get the number of travelled stops (diff between current and previous registered)
                 numTravStops = int(lastBusStop["id"]) - int(lastRegBusStop[busID]["id"])
 
                 if numTravStops > 0:
-                    # We travelled through at least one bus stops
 
+                    if lastBusStop["id"] == 2 and lastRegBusStop[busID]["id"] == 33:
+                        print("deu pau")
+
+                    # We travelled through at least one bus stops
                     # Compute the velocity to get to the current position
                     deltaDistance = distance - prevDistance
                     deltaDate = (date - prevDate).total_seconds()
@@ -262,15 +402,22 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
                     for i in range(numTravStops):
                         passedStop = busStops[prevStopIndex + i + 1]
                         distancePassedBusStop = passedStop["dist"] - prevDistance
-                        timePassedAtBusStop = prevDate + timedelta(seconds=(distancePassedBusStop / velocity))
+                        timePassedAtBusStop = prevDate
+                        if velocity != 0:
+                            timePassedAtBusStop = prevDate + timedelta(seconds=(distancePassedBusStop / velocity))
 
-                        rawHeadway[passedStop["id"]].append((busID, timePassedAtBusStop))
+                        if trips[busID]["x"]:
+                            if trips[busID]["x"][-1] >= timePassedAtBusStop:
+                                print("WTF!!!!")
 
-                        historical[busID].append((timePassedAtBusStop, passedStop["id"]))
-                        x.append(timePassedAtBusStop)
-                        y.append(passedStop["id"])
+                        # rawHeadway[passedStop["id"]].append((busID, timePassedAtBusStop))
+                        if (timePassedAtBusStop.hour == 1 and timePassedAtBusStop.minute == 30 and timePassedAtBusStop.second == 10):
+                            print("WTF ")
+
                         trips[busID]["x"].append(timePassedAtBusStop)
+                        trips[busID]["d"].append(date)
                         trips[busID]["y"].append(passedStop["id"])
+                        trips[busID]["p"].append((lat, lng))
 
 
                 lastRegBusPosition[busID] = avl
@@ -279,10 +426,39 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
         if date.hour >= end:
             break
 
-    plt.show()
-    plt.scatter(x, y)
-    plt.show()
+    # Salva e plota dados que não completaram
+    for busID in trips:
+        if busID in trips:
+            if "y" in trips[busID] and len(trips[busID]["y"]) > 3 and trips[busID]["x"][0].hour >= start :
+                toFinishStop = 37 - trips[busID]["y"][-1]
 
+                if toFinishStop < 3 and toFinishStop > 0:
+                    velocity, prevDistance = getVelocityAndDistance(trips[busID]["x"], trips[busID]["y"], trips[busID]["p"], line, dbCursor)
+                    prevDate = trips[busID]["x"][-1]
+                    prevStopIndex = trips[busID]["y"][-1]
+
+                    for i in range(toFinishStop):
+                        distancePassedBusStop = 14525 - prevDistance
+                        stopid = 37
+                        if (prevStopIndex + i + 1) != 37:
+                            passedStop = busStops[prevStopIndex + i + 1]
+                            distancePassedBusStop = passedStop["dist"] - prevDistance
+                            stopid = passedStop["id"]
+
+                        timePassedAtBusStop = prevDate
+                        if velocity != 0:
+                            timePassedAtBusStop = prevDate + timedelta(seconds=(distancePassedBusStop / velocity))
+
+                        trips[busID]["x"].append(timePassedAtBusStop)
+                        trips[busID]["y"].append(stopid)
+                        trips[busID]["p"].append((lat, lng))
+
+                plt.plot_date(trips[busID]["x"], trips[busID]["y"], "-", color = getColor(busID, trips[busID]["x"][0]), marker="o", markersize=5)
+
+                for i in range(len(trips[busID]["x"])):
+                    rawHeadway[trips[busID]["y"][i]].append((busID, trips[busID]["x"][i]))
+
+    plt.show()
     return rawHeadway
 
 
@@ -316,13 +492,13 @@ def writeOutput(processedHeadway, output):
 
 
 @click.command()
-@click.option("--avl",     default="avl/diasuteis/dia.2019-03-15.csv", help="AVL data")
-@click.option("--line",    default=263,                                help="Bus Line")
-@click.option("--stops",   default="data/263-pontos.csv",              help="File containing Bus Stops")
-@click.option("--spacing", default=0.0025,                             help="Interpolation Spacing")
-@click.option("--start",   default=8,                                  help="Start time")
-@click.option("--end",     default=10,                                 help="End time")
-@click.option("--headway", default=420,                                help="Expected Scheduled Headway (in seconds)")
+@click.option("--avl",     default="avl/diasuteis/dia.2019-06-12",     help="AVL data")
+@click.option("--line",    default=400,                                help="Bus Line")
+@click.option("--stops",   default="data/400-pontos-corrigido.csv",    help="File containing Bus Stops")
+@click.option("--spacing", default=0.00025,                            help="Interpolation Spacing")
+@click.option("--start",   default=5,                                  help="Start time")
+@click.option("--end",     default=12,                                 help="End time")
+@click.option("--headway", default=1050,                               help="Expected Scheduled Headway (in seconds)")
 @click.option("--db",      default="highway",                          help="PostGreSQL Database")
 @click.option("--dbuser",  default="ufg",                              help="PostGreSQL User")
 @click.option("--dbpass",  default="ufgufg",                           help="PostGreSQL Password")
@@ -353,7 +529,7 @@ def main(avl, line, stops, spacing, start, end, headway, db, dbuser, dbpass, out
         media = np.mean(headwayAtStop)
         min = np.min(headwayAtStop)
         max = np.max(headwayAtStop)
-        print(busStopID, cvh, media, media/60, min, min/60, max, max/60)
+        print(busStopID, cvh, np.std(headwayAtStop), media, media/60, min, min/60, max, max/60)
 
     print("FINISHED PROCESSING")
 
