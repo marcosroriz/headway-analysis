@@ -222,6 +222,11 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
     numdadosbrutos = 0
     numdadosfiltro = 0
 
+    # Clean Dataset
+    cleanAVLFile = open(avlFileName + ".clean.csv", "w+", newline="")
+    cleanAVLWriter = csv.writer(cleanAVLFile, delimiter=',')
+    cleanAVLWriter.writerow(["DATA", "LINHA", "LATITUDE", "LONGITUDE", "DIRECAO", "ESTADO", "LETREIRO"])
+
     # Graphics Config
     style.use("seaborn-paper")
     fig, ax = plt.subplots()
@@ -248,6 +253,8 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
         busID = int(avlData["idonibus"])
         lat = float(avlData["lat"])
         lng = float(avlData["lng"])
+        direcao = int(avlData["direcao"])
+        estado = avlData["estado"]
         letreiro = avlData["letreiro"]
 
         avl = {
@@ -275,6 +282,10 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
                     del lastRegBusStop[busID]
                 continue
 
+            # Write to clean AVL File
+            cleanAVLWriter.writerow([date, busLine, busID, lat, lng, direcao, estado, letreiro])
+            cleanAVLFile.flush()
+
             numdadosfiltro = numdadosfiltro + 1
 
             # Ok, AVL is not an outlier
@@ -283,12 +294,6 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
 
             # Retrieve the last bus stop that this AVL has travelled
             lastBusStop, within = getLastBusStop(lat, lng, distance, busStops)
-
-            if busID == 20142:
-                print("bugzao")
-
-            if busID == 20142 and date.hour == 11 and date.minute == 15 and date.second == 42:
-                print("tou aqui")
 
             # Retrieve the last registered bus stop that this AVL has travelled (that we registered)
             # Check if we have registered anything previously
@@ -459,6 +464,7 @@ def processAVL(avlFileName, line, spacing, start, end, busStops, dbCursor):
                     rawHeadway[trips[busID]["y"][i]].append((busID, trips[busID]["x"][i]))
 
     plt.show()
+    cleanAVLFile.close()
     return rawHeadway
 
 
